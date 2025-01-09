@@ -4,6 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-streamdiffusion"
+version = "0.1.0"
+description = "Realtime Stable Diffusion with tensorrt support"
+authors = [
+    { name="Your Name", email="your.email@example.com" }
+]
 dependencies = [
     "torch==2.1.0",
     "torchvision==0.16.0",
