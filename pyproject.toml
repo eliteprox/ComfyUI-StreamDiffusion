@@ -3,6 +3,7 @@ requires = ["setuptools>=69.5.1", "wheel>=0.43.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
+name = "comfyui-streamdiffusion"
 dependencies = [
     "torch==2.1.0",
     "torchvision==0.16.0",
