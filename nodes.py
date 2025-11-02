@@ -1,169 +1,72 @@
-# --- TensorRT Engine Builder Node (disabled) ---
-# import json
-# import traceback
-# class TRTEngineBuilderNode:
-#     @classmethod
-#     def INPUT_TYPES(cls):
-#         return {
-#             "required": {
-#                 "model_id": ("STRING", {"default": "KBlueLeaf/kohaku-v2.1"}),
-#                 "t_index_list": ("STRING", {"default": "20,35,45", "tooltip": "Comma-separated list of denoising steps (e.g. 20,35,45)"}),
-#                 "height": ("INT", {"default": 512, "min": 64, "max": 2048}),
-#                 "width": ("INT", {"default": 512, "min": 64, "max": 2048}),
-#                 "engine_dir": ("STRING", {"default": "engines", "tooltip": "Directory to save TensorRT engines."}),
-#                 "controlnet_model_ids": ("STRING", {"default": "", "tooltip": "Space/comma-separated ControlNet model IDs (optional)"}),
-#                 "lora_dict_str": ("STRING", {"default": "", "multiline": True, "tooltip": "LoRA dictionary as JSON, e.g. {\"lora1\": 0.7, \"lora2\": 1.0}"}),
-#                 "ipadapter_type": ("STRING", {"default": "", "tooltip": "IPAdapter type: '', 'regular', or 'faceid' (optional)"}),
-#                 "min_timesteps": ("INT", {"default": 1, "min": 1, "max": 50}),
-#                 "max_timesteps": ("INT", {"default": 4, "min": 1, "max": 50}),
-#             }
-#         }
-#     RETURN_TYPES = ("STRING",)
-#     FUNCTION = "build_trt_engine"
-#     CATEGORY = "TensorRT"
-#     DESCRIPTION = "Builds TensorRT engine(s) for the specified model and configuration."
-
-#     def build_trt_engine(self, **kwargs):
-#         try:
-#             from streamdiffusion import StreamDiffusionWrapper
-#         except ImportError:
-#             return ("ERROR: StreamDiffusion package not installed!",)
-
-#         # Parse t_index_list
-#         t_index_raw = kwargs.get("t_index_list", "20,35,45")
-#         try:
-#             t_index_list = [int(x.strip()) for x in t_index_raw.split(",") if x.strip()]
-#         except Exception as e:
-#             return (f"ERROR: Invalid t_index_list: {t_index_raw}",)
-#         if not t_index_list:
-#             return ("ERROR: t_index_list must be a non-empty list of integers.",)
-
-#         # Parse LoRA dict
-#         lora_dict = None
-#         lora_dict_str = kwargs.get("lora_dict_str", "").strip()
-#         if lora_dict_str:
-#             try:
-#                 lora_dict = json.loads(lora_dict_str)
-#                 if not isinstance(lora_dict, dict):
-#                     return ("ERROR: lora_dict_str must be a JSON object (dictionary)",)
-#             except Exception as e:
-#                 return (f"ERROR: Invalid lora_dict_str: {e}",)
-
-#         # Parse ControlNet model IDs
-#         controlnet_ids = []
-#         cn_raw = kwargs.get("controlnet_model_ids", "").strip()
-#         if cn_raw:
-#             if "," in cn_raw:
-#                 controlnet_ids = [x.strip() for x in cn_raw.split(",") if x.strip()]
-#             else:
-#                 controlnet_ids = [x.strip() for x in cn_raw.split() if x.strip()]
-
-#         # Prepare engine build params
-#         params = dict(
-#             model_id=kwargs["model_id"],
-#             t_index_list=t_index_list,
-#             acceleration="tensorrt",
-#             width=kwargs["width"],
-#             height=kwargs["height"],
-#             engine_dir=kwargs["engine_dir"],
-#             lora_dict=lora_dict,
-#         )
-#         # Add ControlNet config if provided
-#         if controlnet_ids:
-#             params["controlnets"] = [{"model_id": cid, "preprocessor": "passthrough", "conditioning_scale": 0.5, "enabled": True, "preprocessor_params": {}} for cid in controlnet_ids]
-#         # Add IPAdapter config if provided
-#         ipadapter_type = kwargs.get("ipadapter_type", "").strip()
-#         if ipadapter_type:
-#             params["ipadapter"] = {"type": ipadapter_type}
-
-#         # Timesteps for engine build
-#         min_timesteps = kwargs.get("min_timesteps", 1)
-#         max_timesteps = kwargs.get("max_timesteps", 4)
-
-#         # Actually build the engine(s)
-#         try:
-#             # This will trigger engine build via wrapper (no inference)
-#             wrapper = StreamDiffusionWrapper(
-#                 model_id_or_path=params["model_id"],
-#                 t_index_list=params["t_index_list"],
-#                 lora_dict=params.get("lora_dict"),
-#                 mode="img2img",
-#                 output_type="pt",
-#                 width=params["width"],
-#                 height=params["height"],
-#                 acceleration="tensorrt",
-#                 engine_dir=params["engine_dir"],
-#                 use_tiny_vae=True,
-#                 use_lcm_lora=True,
-#                 frame_buffer_size=1,
-#                 warmup=1,
-#                 use_denoising_batch=True,
-#                 device="cuda",
-#                 dtype=torch.float16,
-#                 cfg_type="self",
-#                 delta=0.7,
-#                 seed=2,
-#             )
-#             # Optionally, trigger engine build for controlnets/ipadapter by calling prepare()
-#             # (No inference, just engine build)
-#             wrapper.prepare(prompt="engine build", negative_prompt="", guidance_scale=1.0)
-#             return (f"SUCCESS: TensorRT engine(s) built in {params['engine_dir']}",)
-#         except Exception as e:
-#             tb = traceback.format_exc()
-#             return (f"ERROR: {e}\n{tb}",)
-
 import torch
-# --- Modular ControlNet+TRT nodes ---
 from streamdiffusion import create_wrapper_from_config
 from PIL import Image
 import numpy as np
-import torch
 from torchvision.transforms.functional import to_tensor
+import os
+import folder_paths
+from typing import List, Dict, Any, Tuple
+import inspect
+import sys
+import functools
+import json
+
+from .streamdiffusionwrapper import StreamDiffusionWrapper
+
+# --- Helper Functions for Model/Encoder Scanning ---
+
+def _get_ipadapter_models() -> List[str]:
+    """Get list of available IPAdapter model files."""
+    models = ["none"]
+    try:
+        models.extend(folder_paths.get_filename_list("ipadapter"))
+        # Fallback scan if registry is empty
+        if len(models) == 1:
+            default_dir = os.path.join(folder_paths.models_dir, "ipadapter")
+            if os.path.isdir(default_dir):
+                files = [f for f in os.listdir(default_dir)
+                         if os.path.isfile(os.path.join(default_dir, f))
+                         and os.path.splitext(f)[1].lower() in {".bin", ".safetensors", ".pth"}]
+                models.extend(sorted(files))
+    except (OSError, PermissionError) as e:
+        print(f"[StreamDiffusion] Warning: Could not scan ipadapter folder: {e}")
+    return models
+
+def _get_image_encoders() -> List[str]:
+    """Get list of available image encoder directories."""
+    encoders = ["none"]
+    try:
+        ipadapter_dirs = folder_paths.get_folder_paths("ipadapter")
+        # Primary scan via registry
+        if ipadapter_dirs and os.path.exists(ipadapter_dirs[0]):
+            for item in os.listdir(ipadapter_dirs[0]):
+                item_path = os.path.join(ipadapter_dirs[0], item)
+                if os.path.isdir(item_path):
+                    encoders.append(item)
+        # Fallback scan if registry is empty
+        if len(encoders) == 1:
+            default_dir = os.path.join(folder_paths.models_dir, "ipadapter")
+            if os.path.isdir(default_dir):
+                for item in os.listdir(default_dir):
+                    item_path = os.path.join(default_dir, item)
+                    if os.path.isdir(item_path):
+                        encoders.append(item)
+    except (OSError, PermissionError) as e:
+        print(f"[StreamDiffusion] Warning: Could not scan for image encoders: {e}")
+    
+    if len(encoders) == 1:
+        print("[StreamDiffusion] Warning: No image encoders found in ipadapter folder. Please add image_encoder directories.")
+        return ["none (no encoders found)"]
+        
+    return encoders
 
 # 1. Config node
 class ControlNetTRTConfig:
     @classmethod
     def INPUT_TYPES(cls):
-        # Get available IPAdapter models and image encoders
-        ipadapter_models = ["none"] + folder_paths.get_filename_list("ipadapter")
-        # Fallback: if registry returned none-only, scan standard models/ipadapter directory
-        try:
-            if len(ipadapter_models) == 1:  # only ['none'] present
-                default_ipadapter_dir = os.path.join(folder_paths.models_dir, "ipadapter")
-                if os.path.isdir(default_ipadapter_dir):
-                    files = [f for f in os.listdir(default_ipadapter_dir)
-                             if os.path.isfile(os.path.join(default_ipadapter_dir, f))
-                             and os.path.splitext(f)[1].lower() in {".bin", ".safetensors", ".pth"}]
-                    ipadapter_models += sorted(files)
-        except Exception:
-            pass
-        
-        # Get image encoder directories (subdirectories in ipadapter folder)
-        encoders = ["none"]
-        try:
-            ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
-            if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
-                ipadapter_dir = ipadapter_dir_list[0]
-                if os.path.exists(ipadapter_dir):
-                    for item in os.listdir(ipadapter_dir):
-                        item_path = os.path.join(ipadapter_dir, item)
-                        if os.path.isdir(item_path):
-                            encoders.append(item)
-        except Exception as e:
-            print(f"[ControlNetTRTConfig] Warning: Could not scan for image encoders: {e}")
-        # Fallback: if no encoders found via registry, look under models/ipadapter/* directories
-        if encoders == ["none"]:
-            try:
-                default_ipadapter_dir = os.path.join(folder_paths.models_dir, "ipadapter")
-                if os.path.isdir(default_ipadapter_dir):
-                    for item in os.listdir(default_ipadapter_dir):
-                        item_path = os.path.join(default_ipadapter_dir, item)
-                        if os.path.isdir(item_path):
-                            encoders.append(item)
-            except Exception:
-                pass
-        
-        # Get available LoRAs
+        # Get available models and encoders using helper functions
+        ipadapter_models = _get_ipadapter_models()
+        encoders = _get_image_encoders()
         lora_files = ["none"] + folder_paths.get_filename_list("loras")
         
         return {
@@ -217,7 +120,7 @@ class ControlNetTRTConfig:
     CATEGORY = "ControlNet+IPAdapter"
     DESCRIPTION = "Builds a config dictionary for ControlNet and IPAdapter together."
 
-    def build_config(self, **kwargs):
+    def build_config(self, **kwargs: Any) -> Tuple[Dict[str, Any]]:
         # Validate t_index_list
         t_index_raw = kwargs.pop("t_index_list")
         try:
@@ -258,6 +161,11 @@ class ControlNetTRTConfig:
         
         if ipadapter_model and image_encoder:
             # Advanced: IPAdapter model provided via loader node
+            if not os.path.exists(ipadapter_model["model_path"]):
+                raise FileNotFoundError(f"IPAdapter model not found at path: {ipadapter_model['model_path']}")
+            if not os.path.isdir(image_encoder):
+                raise FileNotFoundError(f"Image encoder directory not found at path: {image_encoder}")
+                
             ipadapter_config.append({
                 "ipadapter_model_path": ipadapter_model["model_path"],
                 "image_encoder_path": image_encoder,
@@ -271,7 +179,7 @@ class ControlNetTRTConfig:
             ipadapter_model_name = kwargs.get("ipadapter_model_name", "none")
             image_encoder_name = kwargs.get("image_encoder_name", "none")
             
-            if ipadapter_model_name and ipadapter_model_name != "none" and image_encoder_name and image_encoder_name != "none":
+            if ipadapter_model_name and "none" not in ipadapter_model_name and image_encoder_name and "none" not in image_encoder_name:
                 # Build paths from dropdown selections
                 ipadapter_path = folder_paths.get_full_path("ipadapter", ipadapter_model_name)
                 # Fallback to standard models/ipadapter if registry lookup failed
@@ -279,15 +187,28 @@ class ControlNetTRTConfig:
                     candidate = os.path.join(folder_paths.models_dir, "ipadapter", ipadapter_model_name)
                     if os.path.exists(candidate):
                         ipadapter_path = candidate
+                    else:
+                        raise FileNotFoundError(
+                            f"IPAdapter model '{ipadapter_model_name}' not found in ComfyUI/models/ipadapter/. "
+                            f"Please place the model file there and restart ComfyUI."
+                        )
                 
                 # Image encoder is a subdirectory in ipadapter folder
+                encoder_path = ""
                 ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
                 if ipadapter_dir_list:
                     encoder_path = os.path.join(ipadapter_dir_list[0], image_encoder_name)
-                else:
-                    # Fallback to standard models/ipadapter/<encoder_dir>
+                
+                # Fallback to standard models/ipadapter/<encoder_dir>
+                if not os.path.isdir(encoder_path):
                     encoder_candidate = os.path.join(folder_paths.models_dir, "ipadapter", image_encoder_name)
-                    encoder_path = encoder_candidate if os.path.isdir(encoder_candidate) else ""
+                    if os.path.isdir(encoder_candidate):
+                        encoder_path = encoder_candidate
+                    else:
+                         raise FileNotFoundError(
+                            f"Image encoder directory '{image_encoder_name}' not found in ComfyUI/models/ipadapter/. "
+                            f"Please place the directory there and restart ComfyUI."
+                        )
                 
                 ipadapter_scale = kwargs.get("ipadapter_scale", 0.7)
                 
@@ -309,10 +230,12 @@ class ControlNetTRTConfig:
             if lora_name and lora_name != "none":
                 lora_strength = kwargs.get("lora_strength", 1.0)
                 lora_path = folder_paths.get_full_path("loras", lora_name)
+                if not lora_path or not os.path.exists(lora_path):
+                    raise FileNotFoundError(f"LoRA model '{lora_name}' not found.")
                 lora_dict = {lora_path: lora_strength}
         
         # Build main config dict with all YAML params
-        # Use managed engine directory (not user-configurable)
+        # Use managed engine directory (not user-configurable for stability)
         engine_dir = os.path.join(folder_paths.models_dir, "tensorrt", "StreamDiffusion-engines")
         
         config = dict(
@@ -433,15 +356,12 @@ class ControlNetTRTStreamingSampler:
 
     def generate(self, model, input_image, **kwargs):
         wrapper, config, (height, width) = model
-        import numpy as np
-        from PIL import Image
 
         # --- DYNAMIC PARAM UPDATE LOGIC (from ControlNetTRTUpdateParams) ---
         update_kwargs = {}
         def parse_list(val):
             if val is None:
                 return None
-            import json
             if isinstance(val, str):
                 try:
                     return json.loads(val)
@@ -580,7 +500,7 @@ class ControlNetTRTStreamingSampler:
         prompt = kwargs.get("prompt", None)
         negative_prompt = kwargs.get("negative_prompt", None)
         if (prompt is not None and prompt != config.get("prompt", "")) or (negative_prompt is not None and negative_prompt != config.get("negative_prompt", "")):
-            print(f"[ControlNetTRTStreamingSampler] Updating prompt/negative_prompt via update_prompt (clear_blending=False)")
+            print("[ControlNetTRTStreamingSampler] Updating prompt/negative_prompt via update_prompt (clear_blending=False)")
             new_prompt = prompt if prompt is not None else config.get("prompt", "")
             new_negative_prompt = negative_prompt if negative_prompt is not None else config.get("negative_prompt", "")
             if hasattr(wrapper, "update_prompt"):
@@ -610,7 +530,7 @@ class ControlNetTRTStreamingSampler:
                     for i in range(controlnet_count):
                         wrapper.update_control_image(i, input_pil)
                 else:
-                    print(f"process_video: No ControlNet module found for incoming frame")
+                    print("process_video: No ControlNet module found for incoming frame")
                 _ = wrapper(input_pil)
             self._warmed_wrappers.add(wrapper_id)
         else:
@@ -622,7 +542,7 @@ class ControlNetTRTStreamingSampler:
             for i in range(controlnet_count):
                 wrapper.update_control_image(i, input_pil)
         else:
-            print(f"process_video: No ControlNet module found for incoming frame")
+            print("process_video: No ControlNet module found for incoming frame")
         output_tensor = wrapper(input_pil)
 
         if isinstance(output_tensor, torch.Tensor):
@@ -635,19 +555,6 @@ class ControlNetTRTStreamingSampler:
             output_tensor = to_tensor(output_tensor).permute(1,2,0).unsqueeze(0)
         return (output_tensor,)
 
-
-
-import torch
-import os
-import folder_paths
-from .streamdiffusionwrapper import StreamDiffusionWrapper
-import inspect
-import inspect
-import os
-import sys
-import functools
-from PIL import Image
-from torchvision.transforms.functional import to_tensor
 
 ENGINE_DIR = os.path.join(folder_paths.models_dir,
                           "tensorrt/StreamDiffusion-engines")
@@ -806,6 +713,9 @@ class StreamDiffusionLoraLoader:
         
         # Add new lora to dictionary
         lora_path = folder_paths.get_full_path("loras", lora_name)
+        if not lora_path or not os.path.exists(lora_path):
+            raise FileNotFoundError(f"LoRA model '{lora_name}' not found.")
+            
         lora_dict[lora_path] = strength
         
         return (lora_dict,)
@@ -846,8 +756,10 @@ class StreamDiffusionIPAdapterLoader:
     CATEGORY = "StreamDiffusion"
     DESCRIPTION = "Loads an IPAdapter model from the ComfyUI ipadapter models directory."
 
-    def load_ipadapter(self, ipadapter_model, scale, enabled=True):
+    def load_ipadapter(self, ipadapter_model: str, scale: float, enabled: bool = True) -> Tuple[Dict[str, Any]]:
         ipadapter_path = folder_paths.get_full_path("ipadapter", ipadapter_model)
+        if not ipadapter_path or not os.path.exists(ipadapter_path):
+            raise FileNotFoundError(f"IPAdapter model '{ipadapter_model}' not found.")
         return ({
             "model_path": ipadapter_path,
             "scale": scale,
@@ -857,26 +769,9 @@ class StreamDiffusionIPAdapterLoader:
 class StreamDiffusionImageEncoderLoader:
     @classmethod
     def INPUT_TYPES(s):
-        # Get subdirectories in ipadapter folder for image encoders
-        encoders = []
-        try:
-            ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
-            if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
-                ipadapter_dir = ipadapter_dir_list[0]
-                if os.path.exists(ipadapter_dir):
-                    for item in os.listdir(ipadapter_dir):
-                        item_path = os.path.join(ipadapter_dir, item)
-                        if os.path.isdir(item_path):
-                            encoders.append(item)
-        except Exception as e:
-            print(f"[ImageEncoderLoader] Warning: Could not scan for image encoders: {e}")
-        
-        if not encoders:
-            encoders = ["none"]
-        
         return {
             "required": {
-                "image_encoder": (encoders, {"tooltip": "The image encoder directory in ipadapter folder (e.g., image_encoder)."}),
+                "image_encoder": (_get_image_encoders(), {"tooltip": "The image encoder directory in ipadapter folder (e.g., image_encoder)."}),
             }
         }
 
@@ -886,14 +781,27 @@ class StreamDiffusionImageEncoderLoader:
     CATEGORY = "StreamDiffusion"
     DESCRIPTION = "Loads an image encoder directory from ComfyUI/models/ipadapter/ folder."
 
-    def load_encoder(self, image_encoder):
+    def load_encoder(self, image_encoder: str) -> Tuple[str]:
+        # Handle the "none" case gracefully
+        if "none" in image_encoder:
+            return ("",)
+            
         ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
+        encoder_path = ""
+        
         if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
             ipadapter_dir = ipadapter_dir_list[0]
             encoder_path = os.path.join(ipadapter_dir, image_encoder)
-            return (encoder_path,)
-        else:
-            raise ValueError("IPAdapter folder not found")
+
+        # Fallback scan if not found in registered path
+        if not os.path.isdir(encoder_path):
+            fallback_path = os.path.join(folder_paths.models_dir, "ipadapter", image_encoder)
+            if os.path.isdir(fallback_path):
+                encoder_path = fallback_path
+            else:
+                raise FileNotFoundError(f"Image encoder directory '{image_encoder}' not found.")
+        
+        return (encoder_path,)
 
 class StreamDiffusionCheckpointLoader:
     @classmethod
@@ -1241,6 +1149,7 @@ NODE_CLASS_MAPPINGS = {
     "StreamDiffusionCheckpointLoader": StreamDiffusionCheckpointLoader,
     "StreamDiffusionTensorRTEngineLoader": StreamDiffusionTensorRTEngineLoader,
     "StreamDiffusionLPCheckpointLoader": StreamDiffusionLPCheckpointLoader,
+    "StreamDiffusionVaeLoader": StreamDiffusionVaeLoader,
     "StreamDiffusionIPAdapterLoader": StreamDiffusionIPAdapterLoader,
     "StreamDiffusionImageEncoderLoader": StreamDiffusionImageEncoderLoader,
     "ControlNetTRTConfig": ControlNetTRTConfig,
@@ -1257,6 +1166,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StreamDiffusionCheckpointLoader": "StreamDiffusionCheckpointLoader",
     "StreamDiffusionTensorRTEngineLoader": "StreamDiffusionTensorRTEngineLoader",
     "StreamDiffusionLPCheckpointLoader": "StreamDiffusionLPCheckpointLoader",
+    "StreamDiffusionVaeLoader": "StreamDiffusionVaeLoader",
     "StreamDiffusionIPAdapterLoader": "StreamDiffusionIPAdapterLoader",
     "StreamDiffusionImageEncoderLoader": "StreamDiffusionImageEncoderLoader",
     "ControlNetTRTConfig": "ControlNet + TRT Config",
