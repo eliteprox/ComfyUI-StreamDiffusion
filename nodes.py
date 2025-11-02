@@ -124,13 +124,55 @@ from torchvision.transforms.functional import to_tensor
 class ControlNetTRTConfig:
     @classmethod
     def INPUT_TYPES(cls):
+        # Get available IPAdapter models and image encoders
+        ipadapter_models = ["none"] + folder_paths.get_filename_list("ipadapter")
+        # Fallback: if registry returned none-only, scan standard models/ipadapter directory
+        try:
+            if len(ipadapter_models) == 1:  # only ['none'] present
+                default_ipadapter_dir = os.path.join(folder_paths.models_dir, "ipadapter")
+                if os.path.isdir(default_ipadapter_dir):
+                    files = [f for f in os.listdir(default_ipadapter_dir)
+                             if os.path.isfile(os.path.join(default_ipadapter_dir, f))
+                             and os.path.splitext(f)[1].lower() in {".bin", ".safetensors", ".pth"}]
+                    ipadapter_models += sorted(files)
+        except Exception:
+            pass
+        
+        # Get image encoder directories (subdirectories in ipadapter folder)
+        encoders = ["none"]
+        try:
+            ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
+            if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
+                ipadapter_dir = ipadapter_dir_list[0]
+                if os.path.exists(ipadapter_dir):
+                    for item in os.listdir(ipadapter_dir):
+                        item_path = os.path.join(ipadapter_dir, item)
+                        if os.path.isdir(item_path):
+                            encoders.append(item)
+        except Exception as e:
+            print(f"[ControlNetTRTConfig] Warning: Could not scan for image encoders: {e}")
+        # Fallback: if no encoders found via registry, look under models/ipadapter/* directories
+        if encoders == ["none"]:
+            try:
+                default_ipadapter_dir = os.path.join(folder_paths.models_dir, "ipadapter")
+                if os.path.isdir(default_ipadapter_dir):
+                    for item in os.listdir(default_ipadapter_dir):
+                        item_path = os.path.join(default_ipadapter_dir, item)
+                        if os.path.isdir(item_path):
+                            encoders.append(item)
+            except Exception:
+                pass
+        
+        # Get available LoRAs
+        lora_files = ["none"] + folder_paths.get_filename_list("loras")
+        
         return {
             "required": {
                 # Model and ControlNet fields
-                "model_id": ("STRING", {"default": "Lykon/dreamshaper-8"}),
-                "controlnet_model_id": ("STRING", {"default": "lllyasviel/control_v11p_sd15_canny"}),
+                "model_id": ("STRING", {"default": "Lykon/dreamshaper-8", "tooltip": "Base model ID from HuggingFace or local SD 1.5 checkpoint"}),
+                "controlnet_model_id": ("STRING", {"default": "lllyasviel/control_v11p_sd15_canny", "tooltip": "ControlNet model ID from HuggingFace"}),
                 "conditioning_scale": ("FLOAT", {"default": 0.29, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "preprocessor": ("STRING", {"default": "canny"}),
+                "preprocessor": (["canny", "depth", "hed", "lineart", "sharpen", "passthrough"], {"default": "canny", "tooltip": "ControlNet preprocessor type"}),
                 "low_threshold": ("INT", {"default": 100, "min": 0, "max": 255}),
                 "high_threshold": ("INT", {"default": 200, "min": 0, "max": 255}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048}),
@@ -138,33 +180,36 @@ class ControlNetTRTConfig:
                 "t_index_list": ("STRING", {"default": "20,35,45"}),
                 "frame_buffer_size": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "warmup": ("INT", {"default": 10, "min": 0, "max": 100}),
-                "acceleration": ("STRING", {"default": "tensorrt"}),
+                "acceleration": (["tensorrt", "xformers", "none"], {"default": "tensorrt", "tooltip": "Acceleration method"}),
                 "use_denoising_batch": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 2}),
                 "num_inference_steps": ("INT", {"default": 50, "min": 1, "max": 100}),
                 "use_lcm_lora": ("BOOLEAN", {"default": True}),
-                # LoRA support: JSON string, e.g. {"lora1": 0.7, "lora2": 1.0}
-                "lora_dict_str": ("STRING", {"default": "", "multiline": True, "tooltip": "LoRA dictionary as JSON, e.g. {\"lora1\": 0.7, \"lora2\": 1.0}"}),
                 "prompt": ("STRING", {"default": "", "multiline": True}),
                 "negative_prompt": ("STRING", {"default": "blurry, low quality, distorted, 3d render", "multiline": True, "tooltip": "Text prompt specifying undesired aspects to avoid in the generated image."}),
                 "guidance_scale": ("FLOAT", {"default": 1.1, "min": 0.1, "max": 20.0, "step": 0.01, "tooltip": "Controls the strength of the guidance. Higher values make the image more closely match the prompt."}),
-                # IPAdapter fields
-                "ipadapter_model_path": ("STRING", {"default": "/workspace/ComfyUI/models/ipadapter/ip-adapter-plus_sd15.bin"}),
-                "image_encoder_path": ("STRING", {"default": "/workspace/ComfyUI/models/ipadapter/image_encoder"}),
                 "style_image": ("IMAGE", {"tooltip": "Style image for IPAdapter conditioning."}),
-                "ipadapter_scale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "ipadapter_enabled": ("BOOLEAN", {"default": True}),
                 # ControlNet switch
                 "use_controlnet": ("BOOLEAN", {"default": True, "tooltip": "Enable or disable ControlNet conditioning."}),
-                    # Removed stray fragment; num_image_tokens is correctly defined and used in config
                 "num_image_tokens": ("INT", {"default": 16, "min": 1, "max": 256, "tooltip": "Number of image tokens for conditioning."}),
                 # Additional config fields for TRT
-                "engine_dir": ("STRING", {"default": "/workspace/ComfyUI/engines/", "tooltip": "Directory for TensorRT engine files."}),
-                "device": ("STRING", {"default": "cuda", "tooltip": "Device to run inference on (e.g., cuda, cpu)."}),
-                "dtype": ("STRING", {"default": "float16", "tooltip": "Data type for inference (e.g., float16, float32)."}),
+                "device": (["cuda", "cpu"], {"default": "cuda", "tooltip": "Device to run inference on."}),
+                "dtype": (["float16", "float32"], {"default": "float16", "tooltip": "Data type for inference."}),
                 "use_tiny_vae": ("BOOLEAN", {"default": True, "tooltip": "Use tiny VAE for faster inference."}),
-                "cfg_type": ("STRING", {"default": "self", "tooltip": "Config type for advanced options."}),
+                "cfg_type": (["self", "none", "full", "initialize"], {"default": "self", "tooltip": "Classifier-Free Guidance type."}),
                 "delta": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 3.0, "step": 0.01, "tooltip": "Delta multiplier for virtual residual noise, affecting image diversity."}),
+            },
+            "optional": {
+                # Simple dropdown selections (recommended for most users)
+                "lora_name": (lora_files, {"tooltip": "Select LoRA model from dropdown, or use lora_dict input for multiple LoRAs."}),
+                "lora_strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01, "tooltip": "LoRA strength/scale (only used with lora_name)."}),
+                "ipadapter_model_name": (ipadapter_models, {"tooltip": "Select IPAdapter model from dropdown, or use ipadapter_model input from loader node."}),
+                "ipadapter_scale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "IPAdapter scale (only used with ipadapter_model_name)."}),
+                "image_encoder_name": (encoders, {"tooltip": "Select image encoder from dropdown, or use image_encoder input from loader node."}),
+                # Advanced: loader node inputs (for chaining multiple LoRAs, etc.)
+                "lora_dict": ("LORA_DICT", {"tooltip": "Advanced: LoRA dictionary from StreamDiffusionLoraLoader node (overrides lora_name if provided)."}),
+                "ipadapter_model": ("IPADAPTER_MODEL", {"tooltip": "Advanced: IPAdapter model from StreamDiffusionIPAdapterLoader node (overrides ipadapter_model_name if provided)."}),
+                "image_encoder": ("IMAGE_ENCODER_PATH", {"tooltip": "Advanced: Image encoder from StreamDiffusionImageEncoderLoader node (overrides image_encoder_name if provided)."}),
             }
         }
     RETURN_TYPES = ("MULTICONTROL_CONFIG",)
@@ -173,12 +218,11 @@ class ControlNetTRTConfig:
     DESCRIPTION = "Builds a config dictionary for ControlNet and IPAdapter together."
 
     def build_config(self, **kwargs):
-        import json
         # Validate t_index_list
         t_index_raw = kwargs.pop("t_index_list")
         try:
             t_index_list = [int(x.strip()) for x in t_index_raw.split(",") if x.strip()]
-        except Exception as e:
+        except Exception:
             raise ValueError(f"Invalid t_index_list: {t_index_raw}. Must be a comma-separated list of integers.")
         if not t_index_list or any([not isinstance(x, int) or x < 0 for x in t_index_list]):
             raise ValueError(f"t_index_list must be a non-empty list of non-negative integers. Got: {t_index_list}")
@@ -204,40 +248,73 @@ class ControlNetTRTConfig:
                     "high_threshold": kwargs["high_threshold"]
                 },
             })
-        # Build IPAdapter config
+        
+        # Build IPAdapter config - support both dropdown and loader node inputs
         ipadapter_config = []
-        ipadapter_enabled = kwargs.get("ipadapter_enabled", True)
-        if ipadapter_enabled:
+        
+        # Check for advanced loader node inputs first (takes priority)
+        ipadapter_model = kwargs.get("ipadapter_model", None)
+        image_encoder = kwargs.get("image_encoder", None)
+        
+        if ipadapter_model and image_encoder:
+            # Advanced: IPAdapter model provided via loader node
             ipadapter_config.append({
-                "ipadapter_model_path": kwargs["ipadapter_model_path"],
-                "image_encoder_path": kwargs["image_encoder_path"],
+                "ipadapter_model_path": ipadapter_model["model_path"],
+                "image_encoder_path": image_encoder,
                 "style_image": kwargs["style_image"],
-                "scale": kwargs["ipadapter_scale"],
-                "enabled": True,
+                "scale": ipadapter_model["scale"],
+                "enabled": ipadapter_model.get("enabled", True),
                 "num_image_tokens": kwargs["num_image_tokens"],
             })
         else:
-            # If explicitly disabled, add a config with enabled=False for clarity
-            ipadapter_config.append({
-                "ipadapter_model_path": kwargs["ipadapter_model_path"],
-                "image_encoder_path": kwargs["image_encoder_path"],
-                "style_image": kwargs["style_image"],
-                "scale": kwargs["ipadapter_scale"],
-                "enabled": False,
-                "num_image_tokens": kwargs["num_image_tokens"],
-            })
-
-        # Parse lora_dict_str (JSON) to dict, with error handling
-        lora_dict_str = kwargs.get("lora_dict_str", "").strip()
-        lora_dict = None
-        if lora_dict_str:
-            try:
-                lora_dict = json.loads(lora_dict_str)
-                if not isinstance(lora_dict, dict):
-                    raise ValueError("lora_dict_str must be a JSON object (dictionary)")
-            except Exception as e:
-                raise ValueError(f"Invalid lora_dict_str: {e}\nExample: {{\"lora1\": 0.7, \"lora2\": 1.0}}")
+            # Simple: Check for dropdown selections
+            ipadapter_model_name = kwargs.get("ipadapter_model_name", "none")
+            image_encoder_name = kwargs.get("image_encoder_name", "none")
+            
+            if ipadapter_model_name and ipadapter_model_name != "none" and image_encoder_name and image_encoder_name != "none":
+                # Build paths from dropdown selections
+                ipadapter_path = folder_paths.get_full_path("ipadapter", ipadapter_model_name)
+                # Fallback to standard models/ipadapter if registry lookup failed
+                if not ipadapter_path or not os.path.exists(ipadapter_path):
+                    candidate = os.path.join(folder_paths.models_dir, "ipadapter", ipadapter_model_name)
+                    if os.path.exists(candidate):
+                        ipadapter_path = candidate
+                
+                # Image encoder is a subdirectory in ipadapter folder
+                ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
+                if ipadapter_dir_list:
+                    encoder_path = os.path.join(ipadapter_dir_list[0], image_encoder_name)
+                else:
+                    # Fallback to standard models/ipadapter/<encoder_dir>
+                    encoder_candidate = os.path.join(folder_paths.models_dir, "ipadapter", image_encoder_name)
+                    encoder_path = encoder_candidate if os.path.isdir(encoder_candidate) else ""
+                
+                ipadapter_scale = kwargs.get("ipadapter_scale", 0.7)
+                
+                ipadapter_config.append({
+                    "ipadapter_model_path": ipadapter_path,
+                    "image_encoder_path": encoder_path,
+                    "style_image": kwargs["style_image"],
+                    "scale": ipadapter_scale,
+                    "enabled": True,
+                    "num_image_tokens": kwargs["num_image_tokens"],
+                })
+        
+        # Handle LoRA - support both dropdown and loader node inputs
+        lora_dict = kwargs.get("lora_dict", None)  # From loader node (advanced)
+        
+        if not lora_dict:
+            # Simple: Check for dropdown selection
+            lora_name = kwargs.get("lora_name", "none")
+            if lora_name and lora_name != "none":
+                lora_strength = kwargs.get("lora_strength", 1.0)
+                lora_path = folder_paths.get_full_path("loras", lora_name)
+                lora_dict = {lora_path: lora_strength}
+        
         # Build main config dict with all YAML params
+        # Use managed engine directory (not user-configurable)
+        engine_dir = os.path.join(folder_paths.models_dir, "tensorrt", "StreamDiffusion-engines")
+        
         config = dict(
             model_id=kwargs["model_id"],
             controlnets=controlnet_config,
@@ -251,7 +328,7 @@ class ControlNetTRTConfig:
             use_denoising_batch=kwargs["use_denoising_batch"],
             device=kwargs["device"],
             dtype=kwargs["dtype"],
-            engine_dir=kwargs["engine_dir"],
+            engine_dir=engine_dir,
             use_tiny_vae=kwargs["use_tiny_vae"],
             cfg_type=kwargs["cfg_type"],
             delta=kwargs["delta"],
@@ -298,9 +375,6 @@ class ControlNetTRTStreamingSampler:
 
     @classmethod
     def INPUT_TYPES(cls):
-        # Merge all dynamic params from ControlNetTRTUpdateParams
-        template_json = 'e.g. ["prompt1", "prompt2"] or [["prompt1", 1.0], ["prompt2", 0.5]]'
-        template_csv = 'e.g. prompt1, prompt2'
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "ControlNet+TRT wrapper/model tuple (wrapper, config, resolution)."}),
@@ -309,30 +383,22 @@ class ControlNetTRTStreamingSampler:
             "optional": {
                 "prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Prompt for generation."}),
                 "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Negative prompt for generation."}),
-                # prompt_list, prompt_interpolation_method, seed_list, and seed_interpolation_method are commented out because blending/interpolation of prompts and seeds is only supported in the realtime StreamDiffusion demo, where the backend is continuously generating frames and can update the blend live. In ComfyStream/ComfyUI, single-image workflows do not support these features out of the box. To enable blending/interpolation in ComfyStream, a custom integration is needed to update these parameters for each frame in a streaming or animation context.
-                # "prompt_list": ("STRING", {"tooltip": "Change the prompt(s) used for generation. Accepts JSON or comma-separated list."}),
-                # "prompt_interpolation_method": ("STRING", {"default": "slerp", "tooltip": "How to blend/interpolate multiple prompts (e.g. slerp, lerp)."}),
-                # "seed_list": ("STRING", {"tooltip": "Change the seed(s) for generation. Accepts JSON or comma-separated list."}),
-                # "seed_interpolation_method": ("STRING", {"default": "linear", "tooltip": "How to blend/interpolate multiple seeds (e.g. linear)."}),
+                # Runtime parameter overrides
                 "guidance_scale": ("FLOAT", {"tooltip": "Controls how closely the image matches the prompt. Higher = more adherence."}),
                 "num_inference_steps": ("INT", {"tooltip": "Number of denoising steps. More steps = better quality, slower."}),
                 "delta": ("FLOAT", {"tooltip": "Delta parameter for diversity. Higher = more diverse outputs."}),
                 "t_index_list": ("STRING", {"tooltip": "Timesteps for output. Accepts JSON or comma-separated list."}),
-                # ControlNet major updatable fields
-                "controlnet_model_id": ("STRING", {"tooltip": "Switch to a different ControlNet model."}),
+                # ControlNet runtime overrides
+                "controlnet_model_id": ("STRING", {"tooltip": "HuggingFace model ID to switch ControlNet model at runtime."}),
                 "conditioning_scale": ("FLOAT", {"tooltip": "ControlNet conditioning strength. Higher = stronger effect."}),
                 "controlnet_enabled": ("BOOLEAN", {"default": None, "tooltip": "Enable or disable ControlNet conditioning."}),
                 "preprocessor": ("STRING", {"tooltip": "Select the preprocessor type (e.g. canny, depth, hed, lineart, sharpen)."}),
                 "conditioning_channels": ("INT", {"tooltip": "Number of conditioning channels for ControlNet (advanced)."}),
                 "weight_type": ("STRING", {"tooltip": "ControlNet weight type (advanced, e.g. uniform, linear)."}),
-                "image_path": ("STRING", {"tooltip": "Path to new control image for ControlNet."}),
-                # IPAdapter major updatable fields
+                # IPAdapter runtime overrides
                 "ipadapter_enabled": ("BOOLEAN", {"default": None, "tooltip": "Enable or disable IPAdapter conditioning."}),
                 "ipadapter_scale": ("FLOAT", {"tooltip": "IPAdapter conditioning strength. Higher = stronger effect."}),
-                "ipadapter_model_path": ("STRING", {"tooltip": "Switch to a different IPAdapter model."}),
-                "image_encoder_path": ("STRING", {"tooltip": "Path to image encoder for IPAdapter."}),
                 "num_image_tokens": ("INT", {"tooltip": "Number of image tokens for IPAdapter conditioning."}),
-                "style_image_path": ("STRING", {"tooltip": "Path to new style image for IPAdapter."}),
                 "ipadapter_weight_type": ("STRING", {"tooltip": "IPAdapter per-layer scaling method (e.g. uniform, linear)."}),
                 # General
                 "normalize_prompt_weights": ("BOOLEAN", {"default": None, "tooltip": "Normalize prompt weights for blending."}),
@@ -436,7 +502,7 @@ class ControlNetTRTStreamingSampler:
         ip_cfg = {}
         ipadapter_enabled = None
         for key in [
-            "ipadapter_scale", "ipadapter_enabled", "ipadapter_model_path", "image_encoder_path", "num_image_tokens", "style_image_path", "ipadapter_weight_type"
+            "ipadapter_scale", "ipadapter_enabled", "num_image_tokens", "ipadapter_weight_type"
         ]:
             val = kwargs.get(key, None)
             if val is None and "ipadapters" in config and len(config["ipadapters"]):
@@ -479,7 +545,7 @@ class ControlNetTRTStreamingSampler:
                     key = param.split('_', 1)[1] if '_' in param else param
                     preproc_params[key] = val
         if controlnet_config and isinstance(controlnet_config[0], dict):
-            for key in ["controlnet_model_id", "conditioning_scale", "controlnet_enabled", "preprocessor", "conditioning_channels", "weight_type", "image_path"]:
+            for key in ["controlnet_model_id", "conditioning_scale", "controlnet_enabled", "preprocessor", "conditioning_channels", "weight_type"]:
                 val = kwargs.get(key, None)
                 if val is None:
                     if key == "controlnet_model_id":
@@ -640,8 +706,8 @@ def get_engine_configs(*, verbose=False):
 
         has_unet = has_vae = False
 
-        for subdir in sorted(os.listdir(parent_dir)):
-            subdir_path = os.path.join(parent_dir, subdir)
+        for subdir in sorted(os.listdir(parent_path)):
+            subdir_path = os.path.join(parent_path, subdir)
             if not os.path.isdir(subdir_path):
                 continue
 
@@ -760,6 +826,74 @@ class StreamDiffusionVaeLoader:
     def load_vae(self, vae_name):
         vae_path = folder_paths.get_full_path("vae", vae_name)
         return (vae_path,)
+
+class StreamDiffusionIPAdapterLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "ipadapter_model": (folder_paths.get_filename_list("ipadapter"), {"tooltip": "The IPAdapter model file to load (e.g., ip-adapter-plus_sd15.bin)."}),
+                "scale": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01, "tooltip": "Scale/strength of the IPAdapter effect."}),
+            },
+            "optional": {
+                "enabled": ("BOOLEAN", {"default": True, "tooltip": "Enable or disable the IPAdapter."}),
+            }
+        }
+
+    RETURN_TYPES = ("IPADAPTER_MODEL",)
+    OUTPUT_TOOLTIPS = ("IPAdapter model configuration.",)
+    FUNCTION = "load_ipadapter"
+    CATEGORY = "StreamDiffusion"
+    DESCRIPTION = "Loads an IPAdapter model from the ComfyUI ipadapter models directory."
+
+    def load_ipadapter(self, ipadapter_model, scale, enabled=True):
+        ipadapter_path = folder_paths.get_full_path("ipadapter", ipadapter_model)
+        return ({
+            "model_path": ipadapter_path,
+            "scale": scale,
+            "enabled": enabled
+        },)
+
+class StreamDiffusionImageEncoderLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        # Get subdirectories in ipadapter folder for image encoders
+        encoders = []
+        try:
+            ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
+            if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
+                ipadapter_dir = ipadapter_dir_list[0]
+                if os.path.exists(ipadapter_dir):
+                    for item in os.listdir(ipadapter_dir):
+                        item_path = os.path.join(ipadapter_dir, item)
+                        if os.path.isdir(item_path):
+                            encoders.append(item)
+        except Exception as e:
+            print(f"[ImageEncoderLoader] Warning: Could not scan for image encoders: {e}")
+        
+        if not encoders:
+            encoders = ["none"]
+        
+        return {
+            "required": {
+                "image_encoder": (encoders, {"tooltip": "The image encoder directory in ipadapter folder (e.g., image_encoder)."}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE_ENCODER_PATH",)
+    OUTPUT_TOOLTIPS = ("Path to the image encoder.",)
+    FUNCTION = "load_encoder"
+    CATEGORY = "StreamDiffusion"
+    DESCRIPTION = "Loads an image encoder directory from ComfyUI/models/ipadapter/ folder."
+
+    def load_encoder(self, image_encoder):
+        ipadapter_dir_list = folder_paths.get_folder_paths("ipadapter")
+        if ipadapter_dir_list and len(ipadapter_dir_list) > 0:
+            ipadapter_dir = ipadapter_dir_list[0]
+            encoder_path = os.path.join(ipadapter_dir, image_encoder)
+            return (encoder_path,)
+        else:
+            raise ValueError("IPAdapter folder not found")
 
 class StreamDiffusionCheckpointLoader:
     @classmethod
@@ -1107,6 +1241,8 @@ NODE_CLASS_MAPPINGS = {
     "StreamDiffusionCheckpointLoader": StreamDiffusionCheckpointLoader,
     "StreamDiffusionTensorRTEngineLoader": StreamDiffusionTensorRTEngineLoader,
     "StreamDiffusionLPCheckpointLoader": StreamDiffusionLPCheckpointLoader,
+    "StreamDiffusionIPAdapterLoader": StreamDiffusionIPAdapterLoader,
+    "StreamDiffusionImageEncoderLoader": StreamDiffusionImageEncoderLoader,
     "ControlNetTRTConfig": ControlNetTRTConfig,
     "ControlNetTRTModelLoader": ControlNetTRTModelLoader,
     "ControlNetTRTStreamingSampler": ControlNetTRTStreamingSampler,
@@ -1121,6 +1257,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "StreamDiffusionCheckpointLoader": "StreamDiffusionCheckpointLoader",
     "StreamDiffusionTensorRTEngineLoader": "StreamDiffusionTensorRTEngineLoader",
     "StreamDiffusionLPCheckpointLoader": "StreamDiffusionLPCheckpointLoader",
+    "StreamDiffusionIPAdapterLoader": "StreamDiffusionIPAdapterLoader",
+    "StreamDiffusionImageEncoderLoader": "StreamDiffusionImageEncoderLoader",
     "ControlNetTRTConfig": "ControlNet + TRT Config",
     "ControlNetTRTModelLoader": "ControlNet + TRT Model Loader",
     "ControlNetTRTStreamingSampler": "ControlNet + TRT Streaming Sampler",
